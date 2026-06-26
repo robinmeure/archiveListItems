@@ -98,14 +98,49 @@ function Copy-ListSettings {
         [Parameter(Mandatory)] $TargetList
     )
 
-    $TargetList.ContentTypesEnabled = $SourceList.ContentTypesEnabled
-    $TargetList.EnableVersioning = $SourceList.EnableVersioning
-    $TargetList.EnableMinorVersions = $SourceList.EnableMinorVersions
-    $TargetList.MajorVersionLimit = $SourceList.MajorVersionLimit
-    $TargetList.MajorWithMinorVersionsLimit = $SourceList.MajorWithMinorVersionsLimit
-    $TargetList.ForceCheckout = $SourceList.ForceCheckout
-    $TargetList.Update()
-    $Context.ExecuteQuery()
+    $settings = @(
+        @{ Name = 'ContentTypesEnabled'; Value = $SourceList.ContentTypesEnabled }
+        @{ Name = 'EnableVersioning'; Value = $SourceList.EnableVersioning }
+        @{ Name = 'EnableMinorVersions'; Value = $SourceList.EnableMinorVersions }
+        @{ Name = 'MajorVersionLimit'; Value = $SourceList.MajorVersionLimit }
+        @{ Name = 'MajorWithMinorVersionsLimit'; Value = $SourceList.MajorWithMinorVersionsLimit }
+        @{ Name = 'ForceCheckout'; Value = $SourceList.ForceCheckout }
+    )
+
+    foreach ($setting in $settings) {
+        try {
+            $TargetList = Get-PnPList -Identity $TargetList.Title
+            switch ($setting.Name) {
+                'ContentTypesEnabled' { $TargetList.ContentTypesEnabled = [bool]$setting.Value }
+                'EnableVersioning' { $TargetList.EnableVersioning = [bool]$setting.Value }
+                'EnableMinorVersions' { $TargetList.EnableMinorVersions = [bool]$setting.Value }
+                'MajorVersionLimit' { $TargetList.MajorVersionLimit = [int]$setting.Value }
+                'MajorWithMinorVersionsLimit' { $TargetList.MajorWithMinorVersionsLimit = [int]$setting.Value }
+                'ForceCheckout' { $TargetList.ForceCheckout = [bool]$setting.Value }
+            }
+            $TargetList.Update()
+            $Context.ExecuteQuery()
+        }
+        catch {
+            Write-Warning "Could not copy list setting '$($setting.Name)': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-FieldDifferences {
+    param(
+        [Parameter(Mandatory)] $SourceField,
+        [Parameter(Mandatory)] $TargetField
+    )
+
+    $differences = [System.Collections.Generic.List[string]]::new()
+    foreach ($propertyName in @('TypeAsString', 'Title', 'Required', 'Hidden')) {
+        if ($SourceField.$propertyName -ne $TargetField.$propertyName) {
+            $differences.Add("${propertyName}: source='$($SourceField.$propertyName)' target='$($TargetField.$propertyName)'")
+        }
+    }
+
+    return @($differences)
 }
 
 Write-Host "Connecting to $SiteUrl ..." -ForegroundColor Green
@@ -117,17 +152,21 @@ Get-PnPProperty -ClientObject $sourceList -Property Fields, ContentTypesEnabled,
 
 $existingTarget = Get-PnPList -Identity $TargetListName -ErrorAction SilentlyContinue
 if ($existingTarget) {
-    if (-not $Overwrite) {
-        throw "Target list '$TargetListName' already exists. Re-run with -Overwrite to delete and recreate it."
+    if ($Overwrite) {
+        Write-Host "Removing existing target list '$TargetListName'..." -ForegroundColor DarkYellow
+        Remove-PnPList -Identity $TargetListName -Force
+        $existingTarget = $null
     }
-
-    Write-Host "Removing existing target list '$TargetListName'..." -ForegroundColor DarkYellow
-    Remove-PnPList -Identity $TargetListName -Force
+    else {
+        Write-Host "Target list '$TargetListName' already exists. Reusing it and checking/copying missing columns..." -ForegroundColor DarkYellow
+    }
 }
 
-$template = Get-ListSafeTemplate -List $sourceList
-Write-Host "Creating target list '$TargetListName' using template '$template'..." -ForegroundColor Cyan
-New-PnPList -Title $TargetListName -Template $template -OnQuickLaunch | Out-Null
+if (-not $existingTarget) {
+    $template = Get-ListSafeTemplate -List $sourceList
+    Write-Host "Creating target list '$TargetListName' using template '$template'..." -ForegroundColor Cyan
+    New-PnPList -Title $TargetListName -Template $template -OnQuickLaunch | Out-Null
+}
 
 $targetList = Get-PnPList -Identity $TargetListName
 Get-PnPProperty -ClientObject $targetList -Property Fields, Id | Out-Null
@@ -147,27 +186,41 @@ catch {
 $targetList = Get-PnPList -Identity $TargetListName
 Get-PnPProperty -ClientObject $targetList -Property Fields, Id | Out-Null
 $targetFieldNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$targetFieldMap = @{}
 foreach ($field in $targetList.Fields) {
     [void]$targetFieldNames.Add($field.InternalName)
+    $targetFieldMap[$field.InternalName] = $field
 }
 
 $copied = 0
+$matched = 0
+$mismatched = 0
 $skipped = 0
 $failed = 0
 
-Write-Host "Copying fields..." -ForegroundColor Cyan
+Write-Host "Checking/copying fields..." -ForegroundColor Cyan
 foreach ($field in $sourceList.Fields) {
+    if ($field.InternalName -ne 'Title') {
+        if (-not $IncludeHidden -and $field.Hidden) {
+            $skipped++
+            continue
+        }
+
+        if ($field.ReadOnlyField -or $field.Sealed -or $field.FromBaseType) {
+            $skipped++
+            continue
+        }
+    }
+
     if ($targetFieldNames.Contains($field.InternalName)) {
-        $skipped++
-        continue
-    }
-
-    if (-not $IncludeHidden -and $field.Hidden) {
-        $skipped++
-        continue
-    }
-
-    if ($field.ReadOnlyField -or $field.Sealed -or $field.FromBaseType) {
+        $differences = Get-FieldDifferences -SourceField $field -TargetField $targetFieldMap[$field.InternalName]
+        if ($differences.Count -eq 0) {
+            $matched++
+        }
+        else {
+            $mismatched++
+            Write-Warning "Existing field '$($field.InternalName)' differs: $($differences -join '; ')"
+        }
         $skipped++
         continue
     }
@@ -189,6 +242,8 @@ Write-Host "`nDone cloning list schema." -ForegroundColor Green
 Write-Host "  Source : $SourceListName" -ForegroundColor Gray
 Write-Host "  Target : $TargetListName" -ForegroundColor Gray
 Write-Host "  Copied : $copied field(s)" -ForegroundColor Gray
+Write-Host "  Matched: $matched existing field(s)" -ForegroundColor Gray
+Write-Host "  Differ : $mismatched existing field(s)" -ForegroundColor Gray
 Write-Host "  Skipped: $skipped field(s)" -ForegroundColor Gray
 Write-Host "  Failed : $failed field(s)" -ForegroundColor Gray
 

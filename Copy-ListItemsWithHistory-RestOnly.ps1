@@ -9,6 +9,10 @@
     Reading : Get-PnPListItem + item.Versions[].FieldValues  (Author/Editor as FieldUserValue)
     Writing : Add-PnPListItem + Set-PnPListItem -UpdateType   (CSOM)
 
+    Before copying items, the script builds an inventory of fields to copy: Title plus every
+    non-hidden, non-read-only, non-sealed, non-base source field that also exists in the target
+    list. Those fields are then copied for every replayed version.
+
     Why CSOM for writes: a plain REST entity POST/MERGE auto-stamps Modified=now and
     Editor=current user, so the source dates are lost. CSOM UpdateOverwriteVersion writes the
     system fields (Created/Modified/Author/Editor) WITHOUT auto-stamping and WITHOUT adding an
@@ -57,13 +61,101 @@ function ConvertTo-Utc {
     ([datetime]$Value).ToUniversalTime()
 }
 
+function Convert-FieldValueForPnP {
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if ($Value -is [array]) {
+        return @($Value | ForEach-Object { Convert-FieldValueForPnP -Value $_ })
+    }
+
+    $typeName = $Value.GetType().FullName
+    if ($typeName -eq 'Microsoft.SharePoint.Client.FieldUserValue') {
+        if ($Value.Email) { return $Value.Email }
+        if ($Value.LookupValue) { return $Value.LookupValue }
+        return $Value.LookupId
+    }
+
+    if ($typeName -eq 'Microsoft.SharePoint.Client.FieldLookupValue') {
+        return $Value.LookupId
+    }
+
+    return $Value
+}
+
+function Get-CopyFieldInventory {
+    param(
+        [Parameter(Mandatory)] [string]$SourceListName,
+        [Parameter(Mandatory)] [string]$TargetListName
+    )
+
+    $sourceList = Get-PnPList -Identity $SourceListName
+    $targetList = Get-PnPList -Identity $TargetListName
+    Get-PnPProperty -ClientObject $sourceList -Property Fields | Out-Null
+    Get-PnPProperty -ClientObject $targetList -Property Fields | Out-Null
+
+    $targetFieldNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($field in $targetList.Fields) {
+        [void]$targetFieldNames.Add($field.InternalName)
+    }
+
+    $fields = [System.Collections.Generic.List[object]]::new()
+
+    $titleField = $sourceList.Fields | Where-Object { $_.InternalName -eq 'Title' } | Select-Object -First 1
+    if ($titleField -and $targetFieldNames.Contains('Title')) {
+        $fields.Add([pscustomobject]@{
+            InternalName = 'Title'
+            Title        = $titleField.Title
+            TypeAsString = $titleField.TypeAsString
+            Category     = 'Built-in'
+        })
+    }
+
+    foreach ($field in $sourceList.Fields) {
+        if ($field.InternalName -eq 'Title') { continue }
+        if ($field.Hidden -or $field.ReadOnlyField -or $field.Sealed -or $field.FromBaseType) { continue }
+
+        if (-not $targetFieldNames.Contains($field.InternalName)) {
+            Write-Warning "Skipping field '$($field.InternalName)' because it does not exist on target list '$TargetListName'."
+            continue
+        }
+
+        $fields.Add([pscustomobject]@{
+            InternalName = $field.InternalName
+            Title        = $field.Title
+            TypeAsString = $field.TypeAsString
+            Category     = 'Custom'
+        })
+    }
+
+    return @($fields)
+}
+
+function New-FieldValueMap {
+    param(
+        [Parameter(Mandatory)] $FieldValues,
+        [Parameter(Mandatory)] [object[]]$CopyFields
+    )
+
+    $values = @{}
+    foreach ($field in $CopyFields) {
+        if ($FieldValues.ContainsKey($field.InternalName)) {
+            $values[$field.InternalName] = Convert-FieldValueForPnP -Value $FieldValues[$field.InternalName]
+        }
+    }
+
+    return $values
+}
+
 # ---------------------------------------------------------------------------
 # Migration of a single item (replays all versions oldest -> newest)
 # ---------------------------------------------------------------------------
 
 function Copy-ItemWithVersionDates {
     param(
-        [Parameter(Mandatory)] [int]$SourceItemId
+        [Parameter(Mandatory)] [int]$SourceItemId,
+        [Parameter(Mandatory)] [object[]]$CopyFields
     )
 
     # Read the source item's full version history via CSOM. Loading Versions populates each
@@ -89,26 +181,24 @@ function Copy-ItemWithVersionDates {
         $modifiedUtc = ConvertTo-Utc -Value $fv["Modified"]   # this version's Modified timestamp
         $editorUser  = $fv["Editor"]
         $editorValue = if ($editorUser.Email) { $editorUser.Email } else { $editorUser.LookupValue }
+        $businessValues = New-FieldValueMap -FieldValues $fv -CopyFields $CopyFields
 
         # Full system-field stamp for this version (Author/Editor by resolvable user value, dates as UTC).
-        $stampValues = @{
-            Title    = $fv["Title"]
-            Notes    = $fv["Notes"]
-            Created  = $createdUtc
-            Modified = $modifiedUtc
-            Author   = $authorValue
-            Editor   = $editorValue
-        }
+        $stampValues = $businessValues.Clone()
+        $stampValues["Created"] = $createdUtc
+        $stampValues["Modified"] = $modifiedUtc
+        $stampValues["Author"] = $authorValue
+        $stampValues["Editor"] = $editorValue
 
         if ($i -eq 0) {
             # Create v1, then overwrite the current version's stamps (no extra version created).
-            $newItem   = Add-PnPListItem -List $ListBName -Values @{ Title = $fv["Title"]; Notes = $fv["Notes"] }
+            $newItem   = Add-PnPListItem -List $ListBName -Values $businessValues
             $newItemId = $newItem.Id
             Set-PnPListItem -List $ListBName -Identity $newItemId -Values $stampValues -UpdateType UpdateOverwriteVersion | Out-Null
         }
         else {
             # Update creates the next version; UpdateOverwriteVersion fixes that version's stamps.
-            Set-PnPListItem -List $ListBName -Identity $newItemId -Values @{ Title = $fv["Title"]; Notes = $fv["Notes"] } -UpdateType Update | Out-Null
+            Set-PnPListItem -List $ListBName -Identity $newItemId -Values $businessValues -UpdateType Update | Out-Null
             Set-PnPListItem -List $ListBName -Identity $newItemId -Values $stampValues -UpdateType UpdateOverwriteVersion | Out-Null
         }
     }
@@ -123,13 +213,23 @@ function Copy-ItemWithVersionDates {
 Write-Host "Connecting to $SiteUrl ..." -ForegroundColor Green
 Connect-PnPOnline -Url $SiteUrl -Interactive -ClientId $ClientId
 
+$copyFields = Get-CopyFieldInventory -SourceListName $ListAName -TargetListName $ListBName
+if ($copyFields.Count -eq 0) {
+    throw "No copyable fields were found. The target list must at least contain the Title field or matching custom fields."
+}
+
+Write-Host "`nField inventory to copy:" -ForegroundColor Cyan
+foreach ($field in $copyFields) {
+    Write-Host "  [$($field.Category)] $($field.InternalName) ('$($field.Title)', $($field.TypeAsString))" -ForegroundColor Gray
+}
+
 $sourceIds = Get-RestCollection -RelativeUrl "/_api/web/lists/getbytitle('$ListAName')/items?`$select=Id&`$orderby=Id&`$top=5000" |
     ForEach-Object { [int]$_.Id }
 
 Write-Host "Migrating $($sourceIds.Count) item(s) '$ListAName' -> '$ListBName' (with per-version dates)..." -ForegroundColor Green
 
 foreach ($id in $sourceIds) {
-    $newId = Copy-ItemWithVersionDates -SourceItemId $id
+    $newId = Copy-ItemWithVersionDates -SourceItemId $id -CopyFields $copyFields
     Write-Host "  Copied source #$id -> target #$newId" -ForegroundColor DarkGray
 }
 
