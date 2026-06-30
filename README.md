@@ -9,13 +9,14 @@ The main goal is to support this scenario:
 - You want to copy the items, including their version history.
 - You want each copied version to keep its original `Created`, `Modified`, `Author`, and `Editor` metadata.
 - You want custom columns, such as `Notes`, to be copied as well.
+- You want each item's attachments to be copied to the target as well.
 
 ## What The Scripts Do
 
 | Script | Purpose |
 | --- | --- |
 | `Copy-ListSchema.ps1` | Creates a new list based on an existing list and copies its custom/list-specific columns. Run this first when your target list does not already have matching columns. |
-| `Copy-ListItemsWithHistory-RestOnly.ps1` | Copies list items from source to target, recreates each version, copies all included field values, and stamps the original metadata on each version. |
+| `Copy-ListItemsWithHistory-RestOnly.ps1` | Copies list items from source to target, recreates each version, copies all included field values, copies each item's attachments, and stamps the original metadata on each version. |
 | `Compare-ListItemVersions.ps1` | Verifies that source and target versions match for `Created`, `Modified`, `Author`, and `Editor`. |
 
 > Note: The item copy script name still includes `RestOnly` from an earlier experiment. The final working version uses PnP/CSOM for version and metadata writes because that is what reliably preserves per-version system fields in SharePoint Online.
@@ -172,6 +173,16 @@ The script copies:
 - each version's original `Modified`
 - each version's original `Author`
 - each version's original `Editor`
+- each item's attachments
+
+After the version history is replayed, the script streams each source attachment to the matching target item. Because SharePoint does not version attachments, adding them bumps the target item's version once; the script restamps that version with the latest source metadata so its `Author`, `Editor`, and `Modified` stay correct instead of showing the migration account and current time.
+
+The verify output at the end of the run reports the version count, attachment count, and the current `Editor`/`Modified` for each target item, for example:
+
+```text
+  Target #1 : 3 versions (latest 'Item one'), 2 attachment(s)
+             current metadata -> Editor: user@contoso.com, Modified: 1/2/2026 10:15:00 AM
+```
 
 ## Step 5: Verify The Copy
 
@@ -220,6 +231,10 @@ The item copy script only copies custom fields that exist on both source and tar
 If a source field is missing on the target list, the script prints a warning and skips that field.
 
 Use `Copy-ListSchema.ps1` first if you want the target list to have matching custom columns.
+
+### Attachments Add One Extra Version
+
+SharePoint does not version attachments, so they are copied once after the version history is replayed. Adding an attachment to an existing item always creates a new version, so a target item that has attachments will end up with one more version than the source. The script restamps that extra version with the latest source metadata, so its `Author`, `Editor`, and `Modified` are correct (they reflect the source's latest edit, not the migration account).
 
 ### Some Field Types May Need Extra Handling
 
