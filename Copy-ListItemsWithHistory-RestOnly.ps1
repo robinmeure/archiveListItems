@@ -22,6 +22,10 @@
                   version's real Created/Modified/Author/Editor.
     Net result: target version count == source version count, each carrying its original dates.
 
+    After the version history is replayed, the item's attachments are streamed from the source to
+    the target. Attachments are not versioned in SharePoint, so adding them bumps the target item's
+    version once; that version is restamped with the latest source metadata.
+
 .NOTES
     Requires PnP.PowerShell. Connects interactively with a registered Entra ID app (ClientId).
     Run Copy-ListItemsWithHistory.ps1 first to provision List A items with version history.
@@ -148,6 +152,28 @@ function New-FieldValueMap {
     return $values
 }
 
+function Copy-ItemAttachments {
+    param(
+        [Parameter(Mandatory)] [int]$SourceItemId,
+        [Parameter(Mandatory)] [int]$TargetItemId
+    )
+
+    # Attachments are not versioned in SharePoint -- they hang off the current item -- so they are
+    # copied once after the version history has been replayed. Each attachment is streamed straight
+    # from the source item's AttachmentFiles to the target item without touching the local disk.
+    $attachments = Get-RestCollection -RelativeUrl "/_api/web/lists/getbytitle('$ListAName')/items($SourceItemId)/AttachmentFiles?`$select=FileName,ServerRelativeUrl"
+    if ($attachments.Count -eq 0) { return 0 }
+
+    $copied = 0
+    foreach ($attachment in $attachments) {
+        $stream = Get-PnPFile -Url $attachment.ServerRelativeUrl -AsMemoryStream
+        Add-PnPListItemAttachment -List $ListBName -Identity $TargetItemId -FileName $attachment.FileName -Stream $stream | Out-Null
+        $copied++
+    }
+
+    return $copied
+}
+
 # ---------------------------------------------------------------------------
 # Migration of a single item (replays all versions oldest -> newest)
 # ---------------------------------------------------------------------------
@@ -203,6 +229,14 @@ function Copy-ItemWithVersionDates {
         }
     }
 
+    # Copy attachments onto the finished item. Adding an attachment bumps the item version, so we
+    # restamp that version with the latest source metadata ($stampValues from the final loop pass)
+    # to keep its Author/Editor/Modified correct instead of the current user/now.
+    $attachmentCount = Copy-ItemAttachments -SourceItemId $SourceItemId -TargetItemId $newItemId
+    if ($attachmentCount -gt 0) {
+        Set-PnPListItem -List $ListBName -Identity $newItemId -Values $stampValues -UpdateType UpdateOverwriteVersion | Out-Null
+    }
+
     return $newItemId
 }
 
@@ -243,7 +277,18 @@ $targetIds = Get-RestCollection -RelativeUrl "/_api/web/lists/getbytitle('$ListB
 
 foreach ($id in $targetIds) {
     $vers = Get-RestCollection -RelativeUrl "/_api/web/lists/getbytitle('$ListBName')/items($id)/versions?`$select=VersionLabel,Modified,Title"
-    Write-Host "  Target #$id : $($vers.Count) versions (latest '$($vers[0].Title)')" -ForegroundColor Gray
+    $attachments = Get-RestCollection -RelativeUrl "/_api/web/lists/getbytitle('$ListBName')/items($id)/AttachmentFiles?`$select=FileName"
+
+    # Read the current (latest) version metadata via CSOM -- Author/Editor are FieldUserValue, which
+    # the version replay (and the post-attachment restamp) is supposed to have set to the source's
+    # real values. This proves the attachment-add version did NOT keep the migration account / now.
+    $targetItem = Get-PnPListItem -List $ListBName -Id $id
+    $editorUser = $targetItem.FieldValues["Editor"]
+    $editorName = if ($editorUser.Email) { $editorUser.Email } else { $editorUser.LookupValue }
+    $modified   = $targetItem.FieldValues["Modified"]
+
+    Write-Host "  Target #$id : $($vers.Count) versions (latest '$($vers[0].Title)'), $($attachments.Count) attachment(s)" -ForegroundColor Gray
+    Write-Host "             current metadata -> Editor: $editorName, Modified: $modified" -ForegroundColor DarkGray
 }
 
 Write-Host "`nDone." -ForegroundColor Green
