@@ -10,13 +10,14 @@ The main goal is to support this scenario:
 - You want each copied version to keep its original `Created`, `Modified`, `Author`, and `Editor` metadata.
 - You want custom columns, such as `Notes`, to be copied as well.
 - You want each item's attachments to be copied to the target as well.
+- You want the original source item id preserved in a column, because the target list assigns new item ids.
 
 ## What The Scripts Do
 
 | Script | Purpose |
 | --- | --- |
 | `Copy-ListSchema.ps1` | Creates a new list based on an existing list and copies its custom/list-specific columns. Run this first when your target list does not already have matching columns. |
-| `Copy-ListItemsWithHistory-RestOnly.ps1` | Copies list items from source to target, recreates each version, copies all included field values, copies each item's attachments, and stamps the original metadata on each version. |
+| `Copy-ListItemsWithHistory-RestOnly.ps1` | Copies list items from source to target, recreates each version, copies all included field values, copies each item's attachments, preserves the original source item id in a numeric column, and stamps the original metadata on each version. |
 | `Compare-ListItemVersions.ps1` | Verifies that source and target versions match for `Created`, `Modified`, `Author`, and `Editor`. |
 
 > Note: The item copy script name still includes `RestOnly` from an earlier experiment. The final working version uses PnP/CSOM for version and metadata writes because that is what reliably preserves per-version system fields in SharePoint Online.
@@ -174,14 +175,15 @@ The script copies:
 - each version's original `Author`
 - each version's original `Editor`
 - each item's attachments
+- the original source item id, stored in a numeric column (`OriginalItemId` by default)
 
 After the version history is replayed, the script streams each source attachment to the matching target item. Because SharePoint does not version attachments, adding them bumps the target item's version once; the script restamps that version with the latest source metadata so its `Author`, `Editor`, and `Modified` stay correct instead of showing the migration account and current time.
 
-The verify output at the end of the run reports the version count, attachment count, and the current `Editor`/`Modified` for each target item, for example:
+The verify output at the end of the run reports the version count, attachment count, and the current `Editor`, `Modified`, and `OriginalItemId` for each target item, for example:
 
 ```text
   Target #1 : 3 versions (latest 'Item one'), 2 attachment(s)
-             current metadata -> Editor: user@contoso.com, Modified: 1/2/2026 10:15:00 AM
+             current metadata -> Editor: user@contoso.com, Modified: 1/2/2026 10:15:00 AM, OriginalItemId: 1
 ```
 
 ## Step 5: Verify The Copy
@@ -235,6 +237,14 @@ Use `Copy-ListSchema.ps1` first if you want the target list to have matching cus
 ### Attachments Add One Extra Version
 
 SharePoint does not version attachments, so they are copied once after the version history is replayed. Adding an attachment to an existing item always creates a new version, so a target item that has attachments will end up with one more version than the source. The script restamps that extra version with the latest source metadata, so its `Author`, `Editor`, and `Modified` are correct (they reflect the source's latest edit, not the migration account).
+
+### Original Item Id Is Stored In A Column
+
+When items are recreated in the target list, SharePoint assigns them new item ids, so the source `ID` cannot be reused. To keep the link back to the source, the copy script writes the source item id into a dedicated numeric column on the target list.
+
+- The column is named `OriginalItemId` by default. Change it with `-OriginalIdFieldName` if you already use that name for something else.
+- The script creates the column automatically if it does not exist, so you do not have to add it to the target list yourself.
+- The value is written on every replayed version, so it is present throughout the item's history.
 
 ### Some Field Types May Need Extra Handling
 
@@ -313,9 +323,11 @@ Run `Copy-ListSchema.ps1` first, or manually create the missing column on the ta
 
 ### A User Cannot Be Found
 
-The copy script writes `Author` and `Editor` using the user's email where available.
+The copy script writes `Author` and `Editor` using the user's email or login where available. When an account has been deleted from the directory, SharePoint can no longer resolve it and returns `The specified user could not be found`.
 
-This requires the user to be known in the target site. Because the source and target lists are in the same site collection, this normally works. If it does not, make sure the user still exists in the tenant/site user information list.
+The script handles this automatically. `Author` and `Editor` are lookup fields into the site's User Information List, so when the login/email cannot be resolved the script retries using the user's existing User Information List id. This preserves the original author/editor even for deleted accounts, as long as their entry still exists in the User Information List (which is the normal case within the same site collection).
+
+If you see a warning like `Author/Editor could not be resolved by login/email (deleted account); restamping ... via the User Information List`, that is the fallback working as intended, not an error.
 
 ## Example End-To-End Run
 
@@ -374,6 +386,7 @@ Main parameters:
 - `-ClientId`
 - `-ListAName`
 - `-ListBName`
+- `-OriginalIdFieldName` optional (numeric column for the source item id, default `OriginalItemId`)
 
 ### `Compare-ListItemVersions.ps1`
 

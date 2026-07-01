@@ -13,6 +13,10 @@
     non-hidden, non-read-only, non-sealed, non-base source field that also exists in the target
     list. Those fields are then copied for every replayed version.
 
+    The source item id is not preserved when items are re-created (the target assigns new ids), so
+    it is stored in a dedicated numeric column ($OriginalIdFieldName, default 'OriginalItemId').
+    The column is created on the target list when missing and written on every replayed version.
+
     Why CSOM for writes: a plain REST entity POST/MERGE auto-stamps Modified=now and
     Editor=current user, so the source dates are lost. CSOM UpdateOverwriteVersion writes the
     system fields (Created/Modified/Author/Editor) WITHOUT auto-stamping and WITHOUT adding an
@@ -39,7 +43,9 @@ param(
     [Parameter(Mandatory = $true)] [string]$ClientId,
 
     [string]$ListAName = "Migration Source A",
-    [string]$ListBName = "Migration Target B"
+    [string]$ListBName = "Migration Target B",
+
+    [string]$OriginalIdFieldName = "OriginalItemId"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -136,6 +142,24 @@ function Get-CopyFieldInventory {
     return @($fields)
 }
 
+function Confirm-OriginalIdField {
+    param(
+        [Parameter(Mandatory)] [string]$ListName,
+        [Parameter(Mandatory)] [string]$FieldInternalName
+    )
+
+    # The migrated items get brand-new ids in the target list, so the source id is preserved in a
+    # dedicated numeric column. Create it once (idempotent) before the copy loop runs.
+    $existing = Get-PnPField -List $ListName -Identity $FieldInternalName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "Original-id column '$FieldInternalName' already exists on '$ListName'." -ForegroundColor Gray
+        return
+    }
+
+    Write-Host "Creating original-id column '$FieldInternalName' on '$ListName'..." -ForegroundColor Yellow
+    Add-PnPField -List $ListName -DisplayName $FieldInternalName -InternalName $FieldInternalName -Type Number -AddToDefaultView | Out-Null
+}
+
 function New-FieldValueMap {
     param(
         [Parameter(Mandatory)] $FieldValues,
@@ -174,6 +198,44 @@ function Copy-ItemAttachments {
     return $copied
 }
 
+function Set-VersionStamp {
+    <#
+      Overwrite the target item's current version with the source version's real system fields
+      (Created/Modified/Author/Editor + business values) without creating an extra version.
+
+      Author/Editor are lookup fields into the site collection's User Information List. The normal
+      stamp passes a login/email that SharePoint resolves against the directory, but when the
+      original account has been deleted that resolution fails with "The specified user could not be
+      found" and the whole stamp is rejected. In that case retry with Author/Editor set to their
+      User Information List lookup ids: passing the numeric id sets the field by lookup without a
+      directory call, so the original user is preserved as long as their row in that list survives.
+    #>
+    param(
+        [Parameter(Mandatory)] [int]$TargetItemId,
+        [Parameter(Mandatory)] [hashtable]$StampValues,
+        $AuthorUser,
+        $EditorUser
+    )
+
+    try {
+        Set-PnPListItem -List $ListBName -Identity $TargetItemId -Values $StampValues -UpdateType UpdateOverwriteVersion | Out-Null
+    }
+    catch {
+        $message = $_.Exception.Message
+        if ($_.Exception.InnerException) { $message += " " + $_.Exception.InnerException.Message }
+        if ($message -notmatch 'could not be found|cannot be found') { throw }
+
+        # Directory lookup failed (deleted account); fall back to the User Information List row ids.
+        $retryValues = $StampValues.Clone()
+        if ($null -ne $AuthorUser) { $retryValues["Author"] = $AuthorUser.LookupId }
+        if ($null -ne $EditorUser) { $retryValues["Editor"] = $EditorUser.LookupId }
+
+        Write-Warning "Item #$TargetItemId : Author/Editor could not be resolved by login/email (deleted account); restamping Author=$($AuthorUser.LookupId), Editor=$($EditorUser.LookupId) via the User Information List."
+
+        Set-PnPListItem -List $ListBName -Identity $TargetItemId -Values $retryValues -UpdateType UpdateOverwriteVersion | Out-Null
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Migration of a single item (replays all versions oldest -> newest)
 # ---------------------------------------------------------------------------
@@ -208,6 +270,7 @@ function Copy-ItemWithVersionDates {
         $editorUser  = $fv["Editor"]
         $editorValue = if ($editorUser.Email) { $editorUser.Email } else { $editorUser.LookupValue }
         $businessValues = New-FieldValueMap -FieldValues $fv -CopyFields $CopyFields
+        $businessValues[$OriginalIdFieldName] = $SourceItemId   # preserve the source item id in the extra numeric column
 
         # Full system-field stamp for this version (Author/Editor by resolvable user value, dates as UTC).
         $stampValues = $businessValues.Clone()
@@ -220,12 +283,12 @@ function Copy-ItemWithVersionDates {
             # Create v1, then overwrite the current version's stamps (no extra version created).
             $newItem   = Add-PnPListItem -List $ListBName -Values $businessValues
             $newItemId = $newItem.Id
-            Set-PnPListItem -List $ListBName -Identity $newItemId -Values $stampValues -UpdateType UpdateOverwriteVersion | Out-Null
+            Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUser -EditorUser $editorUser
         }
         else {
-            # Update creates the next version; UpdateOverwriteVersion fixes that version's stamps.
+            # Update creates the next version; the stamp then fixes that version's system fields.
             Set-PnPListItem -List $ListBName -Identity $newItemId -Values $businessValues -UpdateType Update | Out-Null
-            Set-PnPListItem -List $ListBName -Identity $newItemId -Values $stampValues -UpdateType UpdateOverwriteVersion | Out-Null
+            Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUser -EditorUser $editorUser
         }
     }
 
@@ -234,7 +297,7 @@ function Copy-ItemWithVersionDates {
     # to keep its Author/Editor/Modified correct instead of the current user/now.
     $attachmentCount = Copy-ItemAttachments -SourceItemId $SourceItemId -TargetItemId $newItemId
     if ($attachmentCount -gt 0) {
-        Set-PnPListItem -List $ListBName -Identity $newItemId -Values $stampValues -UpdateType UpdateOverwriteVersion | Out-Null
+        Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUser -EditorUser $editorUser
     }
 
     return $newItemId
@@ -246,6 +309,8 @@ function Copy-ItemWithVersionDates {
 
 Write-Host "Connecting to $SiteUrl ..." -ForegroundColor Green
 Connect-PnPOnline -Url $SiteUrl -Interactive -ClientId $ClientId
+
+Confirm-OriginalIdField -ListName $ListBName -FieldInternalName $OriginalIdFieldName
 
 $copyFields = Get-CopyFieldInventory -SourceListName $ListAName -TargetListName $ListBName
 if ($copyFields.Count -eq 0) {
@@ -286,9 +351,10 @@ foreach ($id in $targetIds) {
     $editorUser = $targetItem.FieldValues["Editor"]
     $editorName = if ($editorUser.Email) { $editorUser.Email } else { $editorUser.LookupValue }
     $modified   = $targetItem.FieldValues["Modified"]
+    $originalId = $targetItem.FieldValues[$OriginalIdFieldName]
 
     Write-Host "  Target #$id : $($vers.Count) versions (latest '$($vers[0].Title)'), $($attachments.Count) attachment(s)" -ForegroundColor Gray
-    Write-Host "             current metadata -> Editor: $editorName, Modified: $modified" -ForegroundColor DarkGray
+    Write-Host "             current metadata -> Editor: $editorName, Modified: $modified, OriginalItemId: $originalId" -ForegroundColor DarkGray
 }
 
 Write-Host "`nDone." -ForegroundColor Green
