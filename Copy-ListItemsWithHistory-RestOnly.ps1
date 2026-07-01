@@ -17,6 +17,11 @@
     it is stored in a dedicated numeric column ($OriginalIdFieldName, default 'OriginalItemId').
     The column is created on the target list when missing and written on every replayed version.
 
+    Person-field users that no longer exist cannot be written back (SharePoint rejects them with
+    "The specified user could not be found"). Such users are dropped from the write and their
+    original value is recorded in a text column ($UnresolvedUserFieldName, default 'UnresolvedUsers')
+    so the copy continues. Any item that still fails is skipped and reported; the run does not abort.
+
     Why CSOM for writes: a plain REST entity POST/MERGE auto-stamps Modified=now and
     Editor=current user, so the source dates are lost. CSOM UpdateOverwriteVersion writes the
     system fields (Created/Modified/Author/Editor) WITHOUT auto-stamping and WITHOUT adding an
@@ -45,7 +50,8 @@ param(
     [string]$ListAName = "Migration Source A",
     [string]$ListBName = "Migration Target B",
 
-    [string]$OriginalIdFieldName = "OriginalItemId"
+    [string]$OriginalIdFieldName = "OriginalItemId",
+    [string]$UnresolvedUserFieldName = "UnresolvedUsers"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -145,22 +151,40 @@ function Get-CopyFieldInventory {
     return @($fields)
 }
 
-function Confirm-OriginalIdField {
+function Confirm-ListColumn {
     param(
         [Parameter(Mandatory)] [string]$ListName,
-        [Parameter(Mandatory)] [string]$FieldInternalName
+        [Parameter(Mandatory)] [string]$FieldInternalName,
+        [Parameter(Mandatory)] [ValidateSet('Number', 'Note')] [string]$FieldType
     )
 
-    # The migrated items get brand-new ids in the target list, so the source id is preserved in a
-    # dedicated numeric column. Create it once (idempotent) before the copy loop runs.
+    # Ensure a helper column exists on the target list before the copy loop runs (idempotent):
+    #   Number -> holds the original source item id (ids are reassigned on the target).
+    #   Note   -> holds the original value of any person field whose user could not be resolved.
     $existing = Get-PnPField -List $ListName -Identity $FieldInternalName -ErrorAction SilentlyContinue
     if ($existing) {
-        Write-Host "Original-id column '$FieldInternalName' already exists on '$ListName'." -ForegroundColor Gray
+        Write-Host "Column '$FieldInternalName' already exists on '$ListName'." -ForegroundColor Gray
         return
     }
 
-    Write-Host "Creating original-id column '$FieldInternalName' on '$ListName'..." -ForegroundColor Yellow
-    Add-PnPField -List $ListName -DisplayName $FieldInternalName -InternalName $FieldInternalName -Type Number -AddToDefaultView | Out-Null
+    Write-Host "Creating '$FieldType' column '$FieldInternalName' on '$ListName'..." -ForegroundColor Yellow
+    Add-PnPField -List $ListName -DisplayName $FieldInternalName -InternalName $FieldInternalName -Type $FieldType -AddToDefaultView | Out-Null
+}
+
+function Test-SiteUser {
+    param([Parameter(Mandatory)] [int]$LookupId)
+
+    # Person-field values are User Information List lookups. A row that still exists can be written
+    # back by its numeric id; a deleted account whose row is gone cannot, and the write then fails
+    # with "The specified user could not be found". Cache the site's current user ids once and test
+    # membership so unresolvable users are detected up front instead of aborting the copy.
+    if ($null -eq $script:ValidUserIds) {
+        $script:ValidUserIds = [System.Collections.Generic.HashSet[int]]::new()
+        foreach ($siteUser in Get-PnPUser) { [void]$script:ValidUserIds.Add([int]$siteUser.Id) }
+    }
+
+    if (-not $LookupId) { return $false }
+    return $script:ValidUserIds.Contains([int]$LookupId)
 }
 
 function New-FieldValueMap {
@@ -169,14 +193,42 @@ function New-FieldValueMap {
         [Parameter(Mandatory)] [object[]]$CopyFields
     )
 
+    # Returns the values to write plus a note of any person-field users that could not be resolved
+    # (so the caller can record them and keep going instead of failing the whole item).
     $values = @{}
+    $unresolved = [System.Collections.Generic.List[string]]::new()
+
     foreach ($field in $CopyFields) {
-        if ($FieldValues.ContainsKey($field.InternalName)) {
-            $values[$field.InternalName] = Convert-FieldValueForPnP -Value $FieldValues[$field.InternalName]
+        if (-not $FieldValues.ContainsKey($field.InternalName)) { continue }
+        $raw = $FieldValues[$field.InternalName]
+        if ($null -eq $raw) { continue }
+
+        if ($field.TypeAsString -eq 'User' -or $field.TypeAsString -eq 'UserMulti') {
+            $resolvedIds = [System.Collections.Generic.List[int]]::new()
+            foreach ($user in @($raw)) {
+                if ($null -eq $user) { continue }
+                if (Test-SiteUser -LookupId $user.LookupId) {
+                    $resolvedIds.Add([int]$user.LookupId)
+                }
+                else {
+                    $label = if ($user.Email) { $user.Email } elseif ($user.LookupValue) { $user.LookupValue } else { "id $($user.LookupId)" }
+                    $unresolved.Add("$($field.InternalName): $label")
+                }
+            }
+            if ($resolvedIds.Count -gt 0) {
+                if ($field.TypeAsString -eq 'UserMulti') { $values[$field.InternalName] = $resolvedIds.ToArray() }
+                else { $values[$field.InternalName] = $resolvedIds[0] }
+            }
+        }
+        else {
+            $values[$field.InternalName] = Convert-FieldValueForPnP -Value $raw
         }
     }
 
-    return $values
+    return [pscustomobject]@{
+        Values     = $values
+        Unresolved = if ($unresolved.Count -gt 0) { $unresolved -join '; ' } else { $null }
+    }
 }
 
 function Copy-ItemAttachments {
@@ -266,14 +318,25 @@ function Copy-ItemWithVersionDates {
     $authorValue = if ($authorUser.Email) { $authorUser.Email } else { $authorUser.LookupValue }
 
     $newItemId = $null
+    $unresolvedWarned = $false
 
     for ($i = 0; $i -lt $ordered.Count; $i++) {
         $fv          = $ordered[$i].FieldValues
         $modifiedUtc = ConvertTo-Utc -Value $fv["Modified"]   # this version's Modified timestamp
         $editorUser  = $fv["Editor"]
         $editorValue = if ($editorUser.Email) { $editorUser.Email } else { $editorUser.LookupValue }
-        $businessValues = New-FieldValueMap -FieldValues $fv -CopyFields $CopyFields
+        $mapped = New-FieldValueMap -FieldValues $fv -CopyFields $CopyFields
+        $businessValues = $mapped.Values
         $businessValues[$OriginalIdFieldName] = $SourceItemId   # preserve the source item id in the extra numeric column
+        if ($mapped.Unresolved) {
+            # A person column referenced a user that no longer exists; keep the copy going and note
+            # the original value(s) in the fallback text column instead of failing this item.
+            $businessValues[$UnresolvedUserFieldName] = $mapped.Unresolved
+            if (-not $unresolvedWarned) {
+                Write-Warning "Source #$SourceItemId : unresolved user(s) [$($mapped.Unresolved)] stored in column '$UnresolvedUserFieldName'."
+                $unresolvedWarned = $true
+            }
+        }
 
         # Full system-field stamp for this version (Author/Editor by resolvable user value, dates as UTC).
         $stampValues = $businessValues.Clone()
@@ -313,7 +376,8 @@ function Copy-ItemWithVersionDates {
 Write-Host "Connecting to $SiteUrl ..." -ForegroundColor Green
 Connect-PnPOnline -Url $SiteUrl -Interactive -ClientId $ClientId
 
-Confirm-OriginalIdField -ListName $ListBName -FieldInternalName $OriginalIdFieldName
+Confirm-ListColumn -ListName $ListBName -FieldInternalName $OriginalIdFieldName -FieldType Number
+Confirm-ListColumn -ListName $ListBName -FieldInternalName $UnresolvedUserFieldName -FieldType Note
 
 $copyFields = Get-CopyFieldInventory -SourceListName $ListAName -TargetListName $ListBName
 if ($copyFields.Count -eq 0) {
@@ -330,9 +394,20 @@ $sourceIds = Get-RestCollection -RelativeUrl "/_api/web/lists/getbytitle('$ListA
 
 Write-Host "Migrating $($sourceIds.Count) item(s) '$ListAName' -> '$ListBName' (with per-version dates)..." -ForegroundColor Green
 
+$failedIds = [System.Collections.Generic.List[int]]::new()
 foreach ($id in $sourceIds) {
-    $newId = Copy-ItemWithVersionDates -SourceItemId $id -CopyFields $copyFields
-    Write-Host "  Copied source #$id -> target #$newId" -ForegroundColor DarkGray
+    try {
+        $newId = Copy-ItemWithVersionDates -SourceItemId $id -CopyFields $copyFields
+        Write-Host "  Copied source #$id -> target #$newId" -ForegroundColor DarkGray
+    }
+    catch {
+        $failedIds.Add($id)
+        Write-Warning "Skipped source #$id : $($_.Exception.Message)"
+    }
+}
+
+if ($failedIds.Count -gt 0) {
+    Write-Warning "Completed with $($failedIds.Count) item(s) skipped due to errors: $($failedIds -join ', ')."
 }
 
 # ---------------------------------------------------------------------------

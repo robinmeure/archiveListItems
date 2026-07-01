@@ -11,13 +11,14 @@ The main goal is to support this scenario:
 - You want custom columns, such as `Notes`, to be copied as well.
 - You want each item's attachments to be copied to the target as well.
 - You want the original source item id preserved in a column, because the target list assigns new item ids.
+- You want the copy to keep going when a person field references a deleted user, recording the old value instead of failing.
 
 ## What The Scripts Do
 
 | Script | Purpose |
 | --- | --- |
 | `Copy-ListSchema.ps1` | Creates a new list based on an existing list and copies its custom/list-specific columns. Run this first when your target list does not already have matching columns. |
-| `Copy-ListItemsWithHistory-RestOnly.ps1` | Copies list items from source to target, recreates each version, copies all included field values, copies each item's attachments, preserves the original source item id in a numeric column, and stamps the original metadata on each version. |
+| `Copy-ListItemsWithHistory-RestOnly.ps1` | Copies list items from source to target, recreates each version, copies all included field values, copies each item's attachments, preserves the original source item id in a numeric column, and stamps the original metadata on each version. Person-field users that no longer exist are recorded in a text column and skipped so the run keeps going. |
 | `Compare-ListItemVersions.ps1` | Verifies that source and target versions match for `Created`, `Modified`, `Author`, and `Editor`. |
 
 > Note: The item copy script name still includes `RestOnly` from an earlier experiment. The final working version uses PnP/CSOM for version and metadata writes because that is what reliably preserves per-version system fields in SharePoint Online.
@@ -176,6 +177,7 @@ The script copies:
 - each version's original `Editor`
 - each item's attachments
 - the original source item id, stored in a numeric column (`OriginalItemId` by default)
+- the original value of any person field whose user no longer exists, stored in a text column (`UnresolvedUsers` by default)
 
 After the version history is replayed, the script streams each source attachment to the matching target item. Because SharePoint does not version attachments, adding them bumps the target item's version once; the script restamps that version with the latest source metadata so its `Author`, `Editor`, and `Modified` stay correct instead of showing the migration account and current time.
 
@@ -245,6 +247,19 @@ When items are recreated in the target list, SharePoint assigns them new item id
 - The column is named `OriginalItemId` by default. Change it with `-OriginalIdFieldName` if you already use that name for something else.
 - The script creates the column automatically if it does not exist, so you do not have to add it to the target list yourself.
 - The value is written on every replayed version, so it is present throughout the item's history.
+
+### Deleted Users In Person Fields Do Not Stop The Copy
+
+`Author`, `Editor`, and any custom person/group column are lookups into the site's User Information List. If an account has been deleted and its list entry is gone, SharePoint cannot write it back and returns `The specified user could not be found`.
+
+The copy script works around this instead of failing:
+
+- Before writing a person column, it checks whether each referenced user still exists on the site. Users that still exist are copied normally.
+- A user that can no longer be resolved is left out of that column, and its original value (email or display name) is written to a text column so the information is not lost.
+- The column is named `UnresolvedUsers` by default. Change it with `-UnresolvedUserFieldName`. The script creates it automatically if it does not exist.
+- A warning names the affected item and value, for example `Source #12 : unresolved user(s) [AssignedTo: jane@contoso.com] stored in column 'UnresolvedUsers'.`
+
+If an item still fails for any other reason, that single item is skipped (not the whole run) and its id is listed at the end, for example `Completed with 2 item(s) skipped due to errors: 12, 47.`
 
 ### Some Field Types May Need Extra Handling
 
@@ -323,13 +338,12 @@ Run `Copy-ListSchema.ps1` first, or manually create the missing column on the ta
 
 ### A User Cannot Be Found
 
-The copy script writes `Author` and `Editor` using the user's email or login where available. When an account has been deleted from the directory, SharePoint can no longer resolve it and returns `The specified user could not be found`.
+When an account has been deleted, SharePoint can no longer resolve it and returns `The specified user could not be found`. The copy script deals with this in two ways, so it is expected behaviour rather than a failure:
 
-The script handles this automatically. `Author` and `Editor` are lookup fields into the site's User Information List, so when the login/email cannot be resolved the script retries using the user's existing User Information List id. This preserves the original author/editor even for deleted accounts, as long as their entry still exists in the User Information List (which is the normal case within the same site collection).
+- `Author` and `Editor`: these are stamped by email/login first; if that cannot be resolved, the script retries using the user's User Information List id. You may see a warning like `Author/Editor could not be resolved by login/email (deleted account); restamping ... via the User Information List`.
+- Custom person/group columns (such as `Assigned To`): each referenced user is checked first. Resolvable users are copied; a user whose User Information List entry is gone is dropped from that column and its original value is saved to the `UnresolvedUsers` text column. You may see a warning like `Source #12 : unresolved user(s) [AssignedTo: jane@contoso.com] stored in column 'UnresolvedUsers'.`
 
-Custom person/group columns are handled the same way. Their values are always written using the User Information List id, so a deleted user in a column such as `Assigned To` does not break the copy.
-
-If you see a warning like `Author/Editor could not be resolved by login/email (deleted account); restamping ... via the User Information List`, that is the fallback working as intended, not an error.
+See "Deleted Users In Person Fields Do Not Stop The Copy" above for details. If an item cannot be copied for any other reason, it is skipped and reported at the end so the rest of the run still completes.
 
 ## Example End-To-End Run
 
@@ -389,6 +403,7 @@ Main parameters:
 - `-ListAName`
 - `-ListBName`
 - `-OriginalIdFieldName` optional (numeric column for the source item id, default `OriginalItemId`)
+- `-UnresolvedUserFieldName` optional (text column for unresolvable person-field values, default `UnresolvedUsers`)
 
 ### `Compare-ListItemVersions.ps1`
 
