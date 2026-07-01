@@ -82,8 +82,11 @@ function Convert-FieldValueForPnP {
 
     $typeName = $Value.GetType().FullName
     if ($typeName -eq 'Microsoft.SharePoint.Client.FieldUserValue') {
-        if ($Value.Email) { return $Value.Email }
-        if ($Value.LookupValue) { return $Value.LookupValue }
+        # Person fields are lookups into the site collection's User Information List. Return the
+        # numeric LookupId so the write sets the field by list id instead of resolving an
+        # email/login against the directory -- that resolution throws "The specified user could not
+        # be found" for accounts that have since been deleted. Source and target share the same site
+        # collection, so the id is valid on the target.
         return $Value.LookupId
     }
 

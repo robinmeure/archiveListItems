@@ -327,6 +327,8 @@ The copy script writes `Author` and `Editor` using the user's email or login whe
 
 The script handles this automatically. `Author` and `Editor` are lookup fields into the site's User Information List, so when the login/email cannot be resolved the script retries using the user's existing User Information List id. This preserves the original author/editor even for deleted accounts, as long as their entry still exists in the User Information List (which is the normal case within the same site collection).
 
+Custom person/group columns are handled the same way. Their values are always written using the User Information List id, so a deleted user in a column such as `Assigned To` does not break the copy.
+
 If you see a warning like `Author/Editor could not be resolved by login/email (deleted account); restamping ... via the User Information List`, that is the fallback working as intended, not an error.
 
 ## Example End-To-End Run
