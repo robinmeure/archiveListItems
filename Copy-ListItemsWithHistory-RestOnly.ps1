@@ -316,6 +316,7 @@ function Copy-ItemWithVersionDates {
     $createdUtc = ConvertTo-Utc -Value $item.FieldValues["Created"]
     $authorUser = $ordered[0].FieldValues["Author"]
     $authorValue = if ($authorUser.Email) { $authorUser.Email } else { $authorUser.LookupValue }
+    $authorResolvable = Test-SiteUser -LookupId $authorUser.LookupId
 
     $newItemId = $null
     $unresolvedWarned = $false
@@ -325,36 +326,50 @@ function Copy-ItemWithVersionDates {
         $modifiedUtc = ConvertTo-Utc -Value $fv["Modified"]   # this version's Modified timestamp
         $editorUser  = $fv["Editor"]
         $editorValue = if ($editorUser.Email) { $editorUser.Email } else { $editorUser.LookupValue }
+        $editorResolvable = Test-SiteUser -LookupId $editorUser.LookupId
         $mapped = New-FieldValueMap -FieldValues $fv -CopyFields $CopyFields
         $businessValues = $mapped.Values
         $businessValues[$OriginalIdFieldName] = $SourceItemId   # preserve the source item id in the extra numeric column
-        if ($mapped.Unresolved) {
-            # A person column referenced a user that no longer exists; keep the copy going and note
-            # the original value(s) in the fallback text column instead of failing this item.
-            $businessValues[$UnresolvedUserFieldName] = $mapped.Unresolved
+
+        # A person column (including the system Author/Editor fields) referenced a user that no
+        # longer exists; keep the copy going and note the original value(s) in the fallback text
+        # column instead of failing this item. Pre-checking Author/Editor here (same way
+        # New-FieldValueMap pre-checks custom Person fields) avoids ever attempting a write with an
+        # unresolvable user, which previously threw uncaught and aborted the whole item.
+        $unresolvedNotes = [System.Collections.Generic.List[string]]::new()
+        if ($mapped.Unresolved) { $unresolvedNotes.Add($mapped.Unresolved) }
+        if (-not $authorResolvable) { $unresolvedNotes.Add("Author: $authorValue") }
+        if (-not $editorResolvable) { $unresolvedNotes.Add("Editor: $editorValue") }
+        if ($unresolvedNotes.Count -gt 0) {
+            $businessValues[$UnresolvedUserFieldName] = $unresolvedNotes -join '; '
             if (-not $unresolvedWarned) {
-                Write-Warning "Source #$SourceItemId : unresolved user(s) [$($mapped.Unresolved)] stored in column '$UnresolvedUserFieldName'."
+                Write-Warning "Source #$SourceItemId : unresolved user(s) [$($unresolvedNotes -join '; ')] stored in column '$UnresolvedUserFieldName'."
                 $unresolvedWarned = $true
             }
         }
 
-        # Full system-field stamp for this version (Author/Editor by resolvable user value, dates as UTC).
+        # Full system-field stamp for this version (Author/Editor by resolvable user value, dates as
+        # UTC). Author/Editor are omitted entirely when unresolvable so the write is never attempted
+        # with a value SharePoint will reject.
         $stampValues = $businessValues.Clone()
         $stampValues["Created"] = $createdUtc
         $stampValues["Modified"] = $modifiedUtc
-        $stampValues["Author"] = $authorValue
-        $stampValues["Editor"] = $editorValue
+        if ($authorResolvable) { $stampValues["Author"] = $authorValue }
+        if ($editorResolvable) { $stampValues["Editor"] = $editorValue }
+
+        $authorUserForRetry = if ($authorResolvable) { $authorUser } else { $null }
+        $editorUserForRetry = if ($editorResolvable) { $editorUser } else { $null }
 
         if ($i -eq 0) {
             # Create v1, then overwrite the current version's stamps (no extra version created).
             $newItem   = Add-PnPListItem -List $ListBName -Values $businessValues
             $newItemId = $newItem.Id
-            Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUser -EditorUser $editorUser
+            Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUserForRetry -EditorUser $editorUserForRetry
         }
         else {
             # Update creates the next version; the stamp then fixes that version's system fields.
             Set-PnPListItem -List $ListBName -Identity $newItemId -Values $businessValues -UpdateType Update | Out-Null
-            Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUser -EditorUser $editorUser
+            Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUserForRetry -EditorUser $editorUserForRetry
         }
     }
 
@@ -363,7 +378,7 @@ function Copy-ItemWithVersionDates {
     # to keep its Author/Editor/Modified correct instead of the current user/now.
     $attachmentCount = Copy-ItemAttachments -SourceItemId $SourceItemId -TargetItemId $newItemId
     if ($attachmentCount -gt 0) {
-        Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUser -EditorUser $editorUser
+        Set-VersionStamp -TargetItemId $newItemId -StampValues $stampValues -AuthorUser $authorUserForRetry -EditorUser $editorUserForRetry
     }
 
     return $newItemId
