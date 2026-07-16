@@ -216,8 +216,13 @@ function New-FieldValueMap {
                 }
             }
             if ($resolvedIds.Count -gt 0) {
-                if ($field.TypeAsString -eq 'UserMulti') { $values[$field.InternalName] = $resolvedIds.ToArray() }
-                else { $values[$field.InternalName] = $resolvedIds[0] }
+                if ($field.TypeAsString -eq 'UserMulti') {
+                    $values[$field.InternalName] = [string[]]@($resolvedIds | ForEach-Object { $_.ToString([System.Globalization.CultureInfo]::InvariantCulture) })
+                }
+                else {
+                    # PnP's scalar User parser only recognizes a lookup id when it is a string.
+                    $values[$field.InternalName] = $resolvedIds[0].ToString([System.Globalization.CultureInfo]::InvariantCulture)
+                }
             }
         }
         else {
@@ -282,8 +287,8 @@ function Set-VersionStamp {
 
         # Directory lookup failed (deleted account); fall back to the User Information List row ids.
         $retryValues = $StampValues.Clone()
-        if ($null -ne $AuthorUser) { $retryValues["Author"] = $AuthorUser.LookupId }
-        if ($null -ne $EditorUser) { $retryValues["Editor"] = $EditorUser.LookupId }
+        if ($null -ne $AuthorUser) { $retryValues["Author"] = $AuthorUser.LookupId.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+        if ($null -ne $EditorUser) { $retryValues["Editor"] = $EditorUser.LookupId.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
 
         Write-Warning "Item #$TargetItemId : Author/Editor could not be resolved by login/email (deleted account); restamping Author=$($AuthorUser.LookupId), Editor=$($EditorUser.LookupId) via the User Information List."
 
